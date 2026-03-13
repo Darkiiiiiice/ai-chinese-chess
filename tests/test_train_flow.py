@@ -25,3 +25,17 @@ def test_train_step_policy_loss_stays_finite_with_probability_targets():
 
     assert math.isfinite(stats["policy_loss"])
     assert math.isfinite(stats["loss"])
+
+
+def test_dataset_loads_online_and_selfplay_files(tmp_path):
+    sample = {
+        "boards": torch.zeros((1, 15, 10, 9), dtype=torch.float32),
+        "policies": torch.zeros((1, 8010), dtype=torch.float32),
+        "values": torch.tensor([0.5], dtype=torch.float32),
+    }
+    torch.save(sample, tmp_path / "selfplay_test.pt")
+    torch.save(sample, tmp_path / "online_test.pt")
+
+    dataset = train_script.AlphaZeroDataset(str(tmp_path))
+
+    assert len(dataset) == 2

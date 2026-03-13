@@ -35,6 +35,8 @@ class XiangqiBrowser:
     @staticmethod
     def describe_sides(player_color: int) -> Tuple[str, str]:
         """Return (our_side, opponent_side) labels in Chinese."""
+        if player_color == 0:
+            return "随机", "随机"
         our_side = '红方' if player_color == 1 else '黑方'
         opponent_side = '黑方' if player_color == 1 else '红方'
         return our_side, opponent_side
@@ -305,8 +307,12 @@ class XiangqiBrowser:
 
         await asyncio.sleep(2)
 
+        await self._select_difficulty()
+
         # Select color (AI color)
-        if self.player_color == -1:
+        if self.player_color == 0:
+            await self._select_color('Random')
+        elif self.player_color == -1:
             # AI is black, player selects black -> AI goes first
             await self._select_color('Black')
         else:
@@ -323,6 +329,24 @@ class XiangqiBrowser:
         # Cache board box
         await self._cache_board_box()
 
+        if self.player_color == 0:
+            await self._resolve_random_player_color()
+
+    async def _select_difficulty(self):
+        """Select bot difficulty from the bot list on the Play Computer screen."""
+        if not 1 <= self.difficulty <= 10:
+            raise ValueError(f"难度必须在 1-10 之间，当前值: {self.difficulty}")
+
+        items = self.page.locator(".all-bots > li .bot-item")
+        item_count = await items.count()
+        if item_count < self.difficulty:
+            raise RuntimeError(
+                f"页面只检测到 {item_count} 个 bot 选项，无法选择难度 {self.difficulty}"
+            )
+
+        await items.nth(self.difficulty - 1).click(timeout=3000)
+        print(f"已选择电脑等级 Level {self.difficulty}")
+
     async def _select_color(self, color: str):
         """Select player color"""
         try:
@@ -331,6 +355,18 @@ class XiangqiBrowser:
             print(f"已选择 {color}")
         except Exception as e:
             print(f"选择颜色失败: {e}")
+
+    async def _resolve_random_player_color(self):
+        """Resolve actual assigned side after choosing random color."""
+        board_state = await self.read_board()
+        red_moves = await self.collect_legal_moves_from_hints(
+            board_state=board_state,
+            color=1,
+            max_pieces=None,
+        )
+        self.player_color = 1 if red_moves else -1
+        side = "红方" if self.player_color == 1 else "黑方"
+        print(f"随机执子结果: 我方为{side}")
 
     async def _click_play(self):
         """Click Play button"""
@@ -1220,10 +1256,19 @@ class XiangqiBrowser:
 
         print(f"游戏数据已保存到 {filepath}")
 
-    async def restart_game(self):
+    async def restart_game(
+        self,
+        difficulty: int = None,
+        player_color: int = None,
+        red_first: bool = True,
+    ):
         """Restart the game"""
         await self.navigate_to_game()
-        await self.setup_game(player_color=self.player_color)
+        await self.setup_game(
+            difficulty=difficulty,
+            player_color=player_color if player_color is not None else self.player_color,
+            red_first=red_first,
+        )
 
 
 async def create_browser_automation(

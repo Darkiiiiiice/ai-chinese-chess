@@ -32,6 +32,7 @@ MAX_MOVES ?= 300
 REPETITION_DRAW_COUNT ?= 6
 RESIGN_THRESHOLD ?= -0.95
 MIN_RESIGN_MOVES ?= 30
+SELFPLAY_WORKERS ?= 1
 
 # 评估参数
 EVAL_GAMES ?= 100
@@ -144,6 +145,8 @@ selfplay:
 			--min-resign-moves $(MIN_RESIGN_MOVES) \
 			--speed-bonus-max $(SPEED_BONUS_MAX) \
 			--draw-penalty $(DRAW_PENALTY) \
+			--batch-size $(BATCH_SIZE) \
+			--num-workers $(SELFPLAY_WORKERS) \
 			--device $(DEVICE); \
 	else \
 		uv run python scripts/self_play.py \
@@ -156,6 +159,8 @@ selfplay:
 			--min-resign-moves $(MIN_RESIGN_MOVES) \
 			--speed-bonus-max $(SPEED_BONUS_MAX) \
 			--draw-penalty $(DRAW_PENALTY) \
+			--batch-size $(BATCH_SIZE) \
+			--num-workers $(SELFPLAY_WORKERS) \
 			--device $(DEVICE); \
 	fi
 
@@ -189,6 +194,7 @@ online-cycle:
 		--online-games $(GAMES) \
 		--online-difficulty $(DIFFICULTY) \
 		--sp-simulations $(SIMULATIONS) \
+		--sp-batch-size $(BATCH_SIZE) \
 		--epochs $(EPOCHS) \
 		--batch $(TRAIN_BATCH) \
 		--lr $(LR) \
@@ -202,6 +208,7 @@ mixed-cycle:
 		--online-games $(GAMES) \
 		--online-difficulty $(DIFFICULTY) \
 		--sp-simulations $(SIMULATIONS) \
+		--sp-batch-size $(BATCH_SIZE) \
 		--epochs $(EPOCHS) \
 		--batch $(TRAIN_BATCH) \
 		--lr $(LR) \

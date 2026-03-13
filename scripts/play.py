@@ -17,8 +17,11 @@ from ai.model import AlphaZero, create_model
 from browser.automate import XiangqiBrowser
 from game.engine import GameState
 from game.reward import (
+    accumulate_step_reward_events,
     compute_draw_penalty_by_player,
     compute_repeat_penalty_by_player,
+    compute_signed_step_reward_by_player,
+    compute_step_capture_reward,
     compute_speed_bonus_by_player,
 )
 
@@ -28,6 +31,7 @@ class OnlineGameData:
 
     def __init__(self):
         self.samples = []
+        self.step_reward_events = []
 
         # Move encoder (same as self_play.py)
         self._init_move_encoder()
@@ -54,14 +58,32 @@ class OnlineGameData:
         """Encode move to index"""
         return self.move_to_idx.get(move, 0)
 
-    def add_sample(self, board: np.ndarray, policy: np.ndarray, move: tuple, player: int):
+    def add_sample(
+        self,
+        board: np.ndarray,
+        policy: np.ndarray,
+        move: tuple,
+        player: int,
+        step_capture_reward: float = 0.0,
+        event_index: int | None = None,
+    ):
         """Add a sample to the dataset"""
         self.samples.append({
             'board': board,
             'policy': policy,
             'move': move,
             'player': player,
+            'step_capture_reward': step_capture_reward,
+            'event_index': event_index,
         })
+
+    def add_step_reward_event(self, step_reward_by_player: dict[int, float]) -> int:
+        """Append a signed immediate reward event and return its index."""
+        self.step_reward_events.append({
+            1: float(step_reward_by_player.get(1, 0.0)),
+            -1: float(step_reward_by_player.get(-1, 0.0)),
+        })
+        return len(self.step_reward_events) - 1
 
     def set_values(
         self,
@@ -84,6 +106,7 @@ class OnlineGameData:
         penalties = repeat_penalty_by_player or {1: 0.0, -1: 0.0}
         speed_bonuses = speed_bonus_by_player or {1: 0.0, -1: 0.0}
         draw_penalties = draw_penalty_by_player or {1: 0.0, -1: 0.0}
+        cumulative_step_rewards = accumulate_step_reward_events(self.step_reward_events)
 
         for entry in self.samples:
             player = entry['player']
@@ -105,6 +128,14 @@ class OnlineGameData:
                 # 和棋: 吃子奖励权重降低
                 entry['value'] = cap_reward * 0.5
 
+            event_index = entry.get('event_index')
+            if (
+                isinstance(event_index, int)
+                and 0 <= event_index < len(cumulative_step_rewards)
+            ):
+                entry['value'] += cumulative_step_rewards[event_index].get(player, 0.0)
+            else:
+                entry['value'] += entry.get('step_capture_reward', 0.0)
             entry['value'] += speed_bonuses.get(player, 0.0)
             entry['value'] -= draw_penalties.get(player, 0.0)
             entry['value'] -= penalties.get(player, 0.0)
@@ -131,6 +162,36 @@ class OnlineGameData:
 
         torch.save(dataset, filepath)
         print(f"已保存 {len(self.samples)} 个样本到 {filepath}")
+
+
+def _get_piece_at_destination(game_state, move: tuple[int, int, int, int]) -> str:
+    """Best-effort lookup of the piece currently sitting on a move destination."""
+    _, _, x2, y2 = move
+    if hasattr(game_state, "get_piece"):
+        return game_state.get_piece(x2, y2)
+    board = getattr(game_state, "board", None)
+    if board is not None:
+        return board[y2][x2]
+    return ""
+
+
+def _infer_captured_piece_from_board_transition(
+    before_board: dict[tuple[int, int], str],
+    after_board: dict[tuple[int, int], str],
+) -> str:
+    """Infer which piece disappeared between two board states."""
+    before_counts: dict[str, int] = {}
+    after_counts: dict[str, int] = {}
+
+    for piece in before_board.values():
+        before_counts[piece] = before_counts.get(piece, 0) + 1
+    for piece in after_board.values():
+        after_counts[piece] = after_counts.get(piece, 0) + 1
+
+    for piece, count in before_counts.items():
+        if after_counts.get(piece, 0) < count:
+            return piece
+    return ""
 
 
 async def play_game_with_data(
@@ -196,6 +257,8 @@ async def play_game_with_data(
 
     max_moves = 200
     move_count = 0
+    forced_result = None
+    forced_my_outcome = "unknown"
 
     while not game_state.is_game_over() and move_count < max_moves:
         move_count += 1
@@ -254,18 +317,28 @@ async def play_game_with_data(
                         latest_board = await browser.read_board()
 
                 if executed_move is None:
-                    print("候选落子全部失败，保持我方回合并重试")
+                    print("候选落子全部失败，判定我方负")
                     board_state = await browser.read_board()
                     XiangqiBrowser.sync_game_state_from_board(game_state, board_state)
-                    game_state.current_player = browser.player_color
-                    continue
+                    forced_result = -browser.player_color
+                    forced_my_outcome = "loss"
+                    break
 
                 # Record sample AFTER browser confirms move
+                captured_piece = _get_piece_at_destination(game_state, executed_move)
+                step_capture_reward = compute_step_capture_reward(
+                    captured_piece
+                )
+                event_index = game_data.add_step_reward_event(
+                    compute_signed_step_reward_by_player(captured_piece, current_player)
+                )
                 game_data.add_sample(
                     board=board_np,
                     policy=policy,
                     move=executed_move,
-                    player=current_player
+                    player=current_player,
+                    step_capture_reward=step_capture_reward,
+                    event_index=event_index,
                 )
 
                 # Update local game state
@@ -309,6 +382,16 @@ async def play_game_with_data(
             # Sync board with browser
             board_state = await browser.read_board()
             print("\n当前棋盘:")
+            opponent_captured_piece = _infer_captured_piece_from_board_transition(
+                baseline_board,
+                board_state,
+            )
+            game_data.add_step_reward_event(
+                compute_signed_step_reward_by_player(
+                    opponent_captured_piece,
+                    -browser.player_color,
+                )
+            )
             XiangqiBrowser.sync_after_opponent_move(game_state, board_state, browser.player_color)
 
         else:
@@ -340,6 +423,16 @@ async def play_game_with_data(
 
             # Sync board with browser
             board_state = await browser.read_board()
+            opponent_captured_piece = _infer_captured_piece_from_board_transition(
+                baseline_board,
+                board_state,
+            )
+            game_data.add_step_reward_event(
+                compute_signed_step_reward_by_player(
+                    opponent_captured_piece,
+                    -browser.player_color,
+                )
+            )
             XiangqiBrowser.sync_after_opponent_move(game_state, board_state, browser.player_color)
 
         await asyncio.sleep(0.5)
@@ -349,8 +442,14 @@ async def play_game_with_data(
     result_text = await browser.get_game_result_text()
     my_outcome = await browser.get_my_game_outcome()
 
+    if forced_result is not None:
+        result = forced_result
+        my_outcome = forced_my_outcome
+
     # Override result from browser if available
-    if result_text == 'red_wins':
+    if forced_result is not None:
+        pass
+    elif result_text == 'red_wins':
         result = 1
     elif result_text == 'black_wins':
         result = -1
@@ -493,8 +592,15 @@ async def _get_ai_move_with_policy(
         batch_size=batch_size
     )
 
-    move = mcts.get_move(game_state)
-    policy = mcts.get_policy(game_state, temperature=0.0)
+    if hasattr(mcts, "get_move_and_policy"):
+        move, policy = mcts.get_move_and_policy(
+            game_state,
+            temperature=1.0,
+            policy_temperature=1.0,
+        )
+    else:
+        move = mcts.get_move(game_state)
+        policy = mcts.get_policy(game_state, temperature=1.0)
 
     return move, policy
 
@@ -572,7 +678,7 @@ async def run_automated_play(
     model_path: str = None,
     num_games: int = 1,
     difficulty: int = 1,
-    player_color: int = 1,  # 1=red, -1=black
+    player_color: int = 1,  # 1=red, -1=black, 0=random
     red_first: bool = True,
     num_simulations: int = 400,
     batch_size: int = 16,
@@ -592,7 +698,7 @@ async def run_automated_play(
         model_path: Path to trained model
         num_games: Number of games to play
         difficulty: Difficulty level (0=easy, 1=medium, 2=hard)
-        player_color: 1 for red, -1 for black
+        player_color: 1 for red, -1 for black, 0 for random
         red_first: True if player goes first (red)
         num_simulations: MCTS simulations per move
         headless: Run browser in headless mode
@@ -622,79 +728,91 @@ async def run_automated_play(
     stats = {"wins": 0, "losses": 0, "draws": 0}
     total_samples = 0
 
-    for game_idx in range(num_games):
-        print(f"\n{'=' * 50}")
-        print(f"第 {game_idx + 1}/{num_games} 局")
-        print(f"{'=' * 50}")
+    browser = None
+    try:
+        for game_idx in range(num_games):
+            print(f"\n{'=' * 50}")
+            print(f"第 {game_idx + 1}/{num_games} 局")
+            print(f"{'=' * 50}")
 
-        try:
-            # Create browser automation
-            browser = XiangqiBrowser(
-                headless=headless,
-                model=model,
-                player_color=player_color,
-                difficulty=difficulty,
-                num_simulations=num_simulations,
-                batch_size=batch_size,
-            )
+            try:
+                if browser is None:
+                    browser = XiangqiBrowser(
+                        headless=headless,
+                        model=model,
+                        player_color=player_color,
+                        difficulty=difficulty,
+                        num_simulations=num_simulations,
+                        batch_size=batch_size,
+                    )
 
-            # Initialize
-            await browser.initialize()
-            await browser.navigate_to_game()
+                    await browser.initialize()
+                    await browser.navigate_to_game()
+                    await browser.setup_game(
+                        difficulty=difficulty, player_color=player_color, red_first=red_first
+                    )
+                elif game_idx > 0 and restart_after_game:
+                    await browser.restart_game(
+                        difficulty=difficulty,
+                        player_color=player_color,
+                        red_first=red_first,
+                    )
 
-            # Setup game
-            await browser.setup_game(
-                difficulty=difficulty, player_color=player_color, red_first=red_first
-            )
+                # Play game with data collection
+                result = await play_game_with_data(
+                    model,
+                    browser,
+                    save_data,
+                    data_dir,
+                    device,
+                    batch_size,
+                    wait_timeout_ms,
+                    speed_bonus_max,
+                    draw_penalty,
+                )
 
-            # Play game with data collection
-            result = await play_game_with_data(
-                model,
-                browser,
-                save_data,
-                data_dir,
-                device,
-                batch_size,
-                wait_timeout_ms,
-                speed_bonus_max,
-                draw_penalty,
-            )
+                # Update stats
+                actual_player_color = browser.player_color
+                if result["result"] == actual_player_color:
+                    stats["wins"] += 1
+                elif result["result"] == -actual_player_color:
+                    stats["losses"] += 1
+                else:
+                    stats["draws"] += 1
 
-            # Update stats
-            if result["result"] == player_color:
-                stats["wins"] += 1
-            elif result["result"] == -player_color:
-                stats["losses"] += 1
-            else:
-                stats["draws"] += 1
+                total_samples += result.get("samples", 0)
 
-            total_samples += result.get("samples", 0)
+                # Print stats
+                print("\n--- 统计 ---")
+                print(f"胜: {stats['wins']}")
+                print(f"负: {stats['losses']}")
+                print(f"和: {stats['draws']}")
+                print(f"总样本数: {total_samples}")
 
-            # Print stats
-            print("\n--- 统计 ---")
-            print(f"胜: {stats['wins']}")
-            print(f"负: {stats['losses']}")
-            print(f"和: {stats['draws']}")
-            print(f"总样本数: {total_samples}")
+                # Restart or exit
+                if game_idx < num_games - 1 and restart_after_game:
+                    print("\n重新开始游戏...")
+                    await asyncio.sleep(2)
+                elif game_idx < num_games - 1:
+                    break
 
-            # Close browser
+            except Exception as e:
+                print(f"\n游戏出错: {e}")
+                import traceback
+                traceback.print_exc()
+
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    finally:
+                        browser = None
+
+                # Try to continue
+                if game_idx < num_games - 1:
+                    await asyncio.sleep(2)
+    finally:
+        if browser is not None:
             await browser.close()
-
-            # Restart or exit
-            if game_idx < num_games - 1 and restart_after_game:
-                print("\n重新开始游戏...")
-                await asyncio.sleep(2)
-            elif game_idx < num_games - 1:
-                break
-
-        except Exception as e:
-            print(f"\n游戏出错: {e}")
-            import traceback
-            traceback.print_exc()
-
-            # Try to continue
-            if game_idx < num_games - 1:
-                await asyncio.sleep(2)
 
     # Final statistics
     print("\n" + "=" * 50)
@@ -738,8 +856,8 @@ async def main():
         "--color",
         type=int,
         default=1,
-        choices=[1, -1],
-        help="Our side color (1=red, -1=black)",
+        choices=[1, -1, 0],
+        help="Our side color (1=red, -1=black, 0=random)",
     )
     parser.add_argument(
         "--red-first", action="store_true", default=True, help="Red moves first"

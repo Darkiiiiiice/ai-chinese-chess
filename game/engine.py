@@ -102,9 +102,9 @@ class GameState:
                 if self.is_our_piece(x, y):
                     piece_moves = self.get_piece_moves(x, y)
                     for move in piece_moves:
-                        candidate = self.copy()
-                        if candidate.do_move(move):
+                        if self.do_move(move):
                             moves.append(move)
+                            self.undo_move()
         return moves
 
     def get_piece_moves(self, x: int, y: int) -> List[Tuple[int, int, int, int]]:

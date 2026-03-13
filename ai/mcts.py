@@ -16,12 +16,14 @@ class MCTSNode:
         parent: Optional["MCTSNode"] = None,
         move: Optional[Tuple[int, int, int, int]] = None,
         prior: float = 0.0,
+        copy_state: bool = True,
     ):
-        self.state = state.copy()
+        self.state = state.copy() if copy_state else state
         self.parent = parent
         self.move = move
 
         self.children: Dict[Tuple[int, int, int, int], MCTSNode] = {}
+        self._valid_moves: Optional[List[Tuple[int, int, int, int]]] = None
 
         self.Q = 0.0  # Mean value
         self.N = 0  # Visit count
@@ -29,9 +31,15 @@ class MCTSNode:
 
         self.virtual_loss = 0  # Virtual loss for parallel search
 
+    def get_valid_moves(self) -> List[Tuple[int, int, int, int]]:
+        """Return cached valid moves for this node's state."""
+        if self._valid_moves is None:
+            self._valid_moves = self.state.get_all_valid_moves()
+        return self._valid_moves
+
     def is_expanded(self) -> bool:
         """Check if node is fully expanded"""
-        valid_moves = self.state.get_all_valid_moves()
+        valid_moves = self.get_valid_moves()
         return len(self.children) >= len(valid_moves)
 
     def is_leaf(self) -> bool:
@@ -68,7 +76,13 @@ class MCTSNode:
             if move not in self.children:
                 new_state = self.state.copy()
                 if new_state.do_move(move):
-                    self.children[move] = MCTSNode(new_state, self, move, prior)
+                    self.children[move] = MCTSNode(
+                        new_state,
+                        self,
+                        move,
+                        prior,
+                        copy_state=False,
+                    )
 
     def backup(self, value: float):
         """Back up value to root"""
@@ -136,6 +150,39 @@ class MCTS:
         """Decode index to move"""
         return self.idx_to_move.get(idx, (0, 0, 0, 0))
 
+    def _visits_to_policy(self, visits: np.ndarray, temperature: float) -> np.ndarray:
+        """Convert MCTS visit counts to a policy distribution."""
+        if temperature == 0:
+            policy = np.zeros(self.num_moves)
+            if visits.sum() > 0:
+                best_idx = np.argmax(visits)
+                policy[best_idx] = 1.0
+            return policy
+
+        visits = visits ** (1.0 / temperature)
+        if visits.sum() > 0:
+            return visits / visits.sum()
+        return np.ones(self.num_moves) / self.num_moves
+
+    def _run_search(self, state: GameState) -> np.ndarray:
+        """Run one MCTS search and return root visit counts."""
+        root = MCTSNode(state)
+
+        num_batches = (self.num_simulations + self.batch_size - 1) // self.batch_size
+        simulations_done = 0
+
+        for _ in range(num_batches):
+            batch_count = min(self.batch_size, self.num_simulations - simulations_done)
+            self._run_batch_simulation(root, batch_count)
+            simulations_done += batch_count
+
+        visits = np.zeros(self.num_moves)
+        for move, child in root.children.items():
+            idx = self.encode_move(move)
+            visits[idx] = child.N
+
+        return visits
+
     def get_policy(self, state: GameState, temperature: float = None) -> np.ndarray:
         """
         Get action probabilities from MCTS using batch inference
@@ -149,38 +196,37 @@ class MCTS:
         """
         if temperature is None:
             temperature = self.temperature
+        visits = self._run_search(state)
+        return self._visits_to_policy(visits, temperature)
 
-        root = MCTSNode(state)
+    def get_move_and_policy(
+        self,
+        state: GameState,
+        temperature: float = None,
+        policy_temperature: float = 0.0,
+    ) -> Tuple[Tuple[int, int, int, int], np.ndarray]:
+        """Run one MCTS search and return both sampled move and record policy."""
+        if temperature is None:
+            temperature = self.temperature
 
-        # Run batch simulations
-        num_batches = (self.num_simulations + self.batch_size - 1) // self.batch_size
-        simulations_done = 0
+        visits = self._run_search(state)
+        move_policy = self._visits_to_policy(visits.copy(), temperature)
+        record_policy = self._visits_to_policy(visits.copy(), policy_temperature)
 
-        for _ in range(num_batches):
-            batch_count = min(self.batch_size, self.num_simulations - simulations_done)
-            self._run_batch_simulation(root, batch_count)
-            simulations_done += batch_count
+        move_idx = np.random.choice(self.num_moves, p=move_policy)
+        move = self.decode_move(move_idx)
 
-        # Get visit counts
-        visits = np.zeros(self.num_moves)
-        for move, child in root.children.items():
-            idx = self.encode_move(move)
-            visits[idx] = child.N
-
-        # Apply temperature
-        if temperature == 0:
-            policy = np.zeros(self.num_moves)
-            if visits.sum() > 0:
-                best_idx = np.argmax(visits)
-                policy[best_idx] = 1.0
-        else:
-            visits = visits ** (1.0 / temperature)
-            if visits.sum() > 0:
-                policy = visits / visits.sum()
+        valid_moves = state.get_all_valid_moves()
+        if move not in valid_moves:
+            for m in valid_moves:
+                idx = self.encode_move(m)
+                if move_policy[idx] > 0:
+                    move = m
+                    break
             else:
-                policy = np.ones(self.num_moves) / self.num_moves
+                move = valid_moves[0] if valid_moves else None
 
-        return policy
+        return move, record_policy
 
     def _run_batch_simulation(self, root: MCTSNode, batch_size: int):
         """Run multiple simulations in parallel using batch inference"""
@@ -204,7 +250,7 @@ class MCTS:
         for leaf in leaf_nodes:
             board = leaf.state.to_numpy()
             boards.append(board)
-            valid_moves_list.append(leaf.state.get_all_valid_moves())
+            valid_moves_list.append(leaf.get_valid_moves())
 
         # Stack boards into batch
         boards_batch = np.stack(boards, axis=0)
@@ -244,7 +290,7 @@ class MCTS:
             return None, []
 
         # Check if no valid moves
-        valid_moves = node.state.get_all_valid_moves()
+        valid_moves = node.get_valid_moves()
         if len(valid_moves) == 0:
             value = node.state.get_game_result()
             if value is None:
@@ -357,6 +403,15 @@ class MCTSPlayer:
     def get_policy(self, state: GameState, temperature: float = None) -> np.ndarray:
         """Get MCTS policy for current state"""
         return self.mcts.get_policy(state, temperature)
+
+    def get_move_and_policy(
+        self,
+        state: GameState,
+        temperature: float = None,
+        policy_temperature: float = 0.0,
+    ) -> Tuple[Tuple[int, int, int, int], np.ndarray]:
+        """Get move and policy from one MCTS search."""
+        return self.mcts.get_move_and_policy(state, temperature, policy_temperature)
 
     def reset(self):
         """Reset MCTS"""

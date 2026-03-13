@@ -31,3 +31,22 @@ def test_root_expansion_applies_dirichlet_noise(monkeypatch):
 
     assert np.isclose(root.children[moves[0]].P, 0.8, atol=1e-6)
     assert np.isclose(root.children[moves[1]].P, 0.2, atol=1e-6)
+
+
+def test_mcts_node_caches_valid_moves(monkeypatch):
+    state = GameState()
+    node = MCTSNode(state)
+    calls = {"count": 0}
+    original = node.state.get_all_valid_moves
+
+    def _counting_get_all_valid_moves():
+        calls["count"] += 1
+        return original()
+
+    monkeypatch.setattr(node.state, "get_all_valid_moves", _counting_get_all_valid_moves)
+
+    first = node.get_valid_moves()
+    second = node.get_valid_moves()
+
+    assert first == second
+    assert calls["count"] == 1

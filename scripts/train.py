@@ -8,8 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from typing import List, Dict, Tuple
-import numpy as np
+from typing import List, Dict
 import glob
 
 # Add parent directory to path
@@ -28,19 +27,35 @@ class AlphaZeroDataset(Dataset):
         """Load all training data"""
         samples = []
 
-        # Find all data files
-        pattern = os.path.join(data_dir, "selfplay_*.pt")
-        files = glob.glob(pattern)
+        # Find all supported training data files.
+        files = []
+        for pattern in ("selfplay_*.pt", "online_*.pt"):
+            files.extend(glob.glob(os.path.join(data_dir, pattern)))
+        files = sorted(set(files))
 
         if not files:
             print(f"在 {data_dir} 中未找到数据文件")
             return samples
 
-        print(f"正在从 {len(files)} 个文件加载数据...")
+        print(f"[数据加载] 找到 {len(files)} 个数据文件:")
+        print("-" * 60)
 
+        total_samples = 0
         for f in files:
             try:
                 data = torch.load(f)
+                file_samples = len(data["boards"])
+                total_samples += file_samples
+
+                # 获取文件大小
+                file_size = os.path.getsize(f) / 1024  # KB
+
+                # 判断文件类型
+                filename = os.path.basename(f)
+                file_type = "自我对弈" if filename.startswith("selfplay") else "在线对弈"
+
+                print(f"  [{file_type}] {filename}")
+                print(f"      样本数: {file_samples}, 文件大小: {file_size:.1f} KB")
 
                 for i in range(len(data["boards"])):
                     samples.append(
@@ -51,9 +66,10 @@ class AlphaZeroDataset(Dataset):
                         }
                     )
             except Exception as e:
-                print(f"加载 {f} 出错: {e}")
+                print(f"  [错误] 加载 {os.path.basename(f)} 出错: {e}")
 
-        print(f"已加载 {len(samples)} 个样本")
+        print("-" * 60)
+        print(f"[数据加载] 总计: {total_samples} 个样本")
         return samples
 
     def __len__(self):

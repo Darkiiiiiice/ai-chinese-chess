@@ -102,3 +102,24 @@ def test_get_all_valid_moves_excludes_moves_that_leave_own_king_in_check():
     moves = state.get_all_valid_moves()
 
     assert (4, 5, 3, 5) not in moves
+
+
+def test_get_all_valid_moves_does_not_copy_state_per_candidate(monkeypatch):
+    state = GameState()
+    original_board = [row[:] for row in state.board]
+    original_player = state.current_player
+    copy_calls = {"count": 0}
+    original_copy = GameState.copy
+
+    def _counting_copy(self):
+        copy_calls["count"] += 1
+        return original_copy(self)
+
+    monkeypatch.setattr(GameState, "copy", _counting_copy)
+
+    moves = state.get_all_valid_moves()
+
+    assert moves
+    assert copy_calls["count"] == 0
+    assert state.board == original_board
+    assert state.current_player == original_player

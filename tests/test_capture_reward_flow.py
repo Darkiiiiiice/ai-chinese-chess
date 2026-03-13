@@ -135,6 +135,42 @@ def test_online_game_data_set_values_applies_draw_penalty_on_draw():
     assert data.samples[1]["value"] == -0.2
 
 
+def test_online_game_data_set_values_applies_step_capture_reward():
+    data = OnlineGameData()
+    data.samples = [
+        {"player": 1, "step_capture_reward": 1 / 9},
+        {"player": -1, "step_capture_reward": 0.0},
+    ]
+
+    data.set_values(
+        result=0,
+        capture_rewards_by_player={1: 0.0, -1: 0.0},
+    )
+
+    assert math.isclose(data.samples[0]["value"], 1 / 9, rel_tol=1e-9)
+    assert data.samples[1]["value"] == 0.0
+
+
+def test_online_game_data_set_values_accumulates_signed_step_rewards_from_event_timeline():
+    data = OnlineGameData()
+    data.step_reward_events = [
+        {1: 1 / 9, -1: -(1 / 9)},
+        {1: -(4 / 9), -1: 4 / 9},
+    ]
+    data.samples = [
+        {"player": 1, "event_index": 0},
+        {"player": -1, "event_index": 1},
+    ]
+
+    data.set_values(
+        result=0,
+        capture_rewards_by_player={1: 0.0, -1: 0.0},
+    )
+
+    assert math.isclose(data.samples[0]["value"], -3 / 9, rel_tol=1e-9)
+    assert math.isclose(data.samples[1]["value"], 4 / 9, rel_tol=1e-9)
+
+
 def test_undo_move_restores_board_and_capture_tracking_for_capture():
     board = _empty_board()
     board[9][4] = "k"

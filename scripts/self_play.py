@@ -1,5 +1,6 @@
 """Self-play to generate training data"""
 
+import multiprocessing as mp
 import os
 import sys
 from datetime import datetime
@@ -15,8 +16,11 @@ from ai.mcts import MCTSPlayer
 from ai.model import AlphaZero, create_model
 from game.engine import GameState
 from game.reward import (
+    accumulate_step_reward_events,
     compute_draw_penalty_by_player,
     compute_repeat_penalty_by_player,
+    compute_signed_step_reward_by_player,
+    compute_step_capture_reward,
     compute_speed_bonus_by_player,
 )
 
@@ -25,6 +29,112 @@ def build_repetition_key(board: List[List[str]], current_player: int) -> str:
     """Build repetition key including side-to-move."""
     board_str = "".join(["".join(row) for row in board])
     return f"{board_str}|{current_player}"
+
+
+def split_games_across_workers(num_games: int, num_workers: int) -> List[int]:
+    """Split games as evenly as possible across workers."""
+    if num_games <= 0 or num_workers <= 0:
+        return []
+
+    worker_count = min(num_games, num_workers)
+    base = num_games // worker_count
+    remainder = num_games % worker_count
+
+    chunks = []
+    for idx in range(worker_count):
+        chunks.append(base + (1 if idx < remainder else 0))
+    return chunks
+
+
+def _get_piece_at_destination(game_state, move: Tuple[int, int, int, int]) -> str:
+    """Best-effort lookup of the piece currently sitting on a move destination."""
+    _, _, x2, y2 = move
+    if hasattr(game_state, "get_piece"):
+        return game_state.get_piece(x2, y2)
+    board = getattr(game_state, "board", None)
+    if board is not None:
+        return board[y2][x2]
+    return ""
+
+
+def save_dataset(data: List[Dict], save_dir: str, suffix: str):
+    """Save self-play data to disk."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(save_dir, f"selfplay_{suffix}_{timestamp}.pt")
+
+    boards = []
+    policies = []
+    values = []
+
+    for entry in data:
+        boards.append(torch.from_numpy(entry["board"]))
+        policies.append(torch.from_numpy(entry["policy"]))
+        values.append(torch.tensor(entry.get("value", 0), dtype=torch.float32))
+
+    if boards:
+        dataset = {
+            "boards": torch.stack(boards),
+            "policies": torch.stack(policies),
+            "values": torch.stack(values),
+        }
+        torch.save(dataset, filename)
+        print(f"已保存 {len(data)} 个局面到 {filename}")
+
+
+def _run_selfplay_worker(worker_args: Dict) -> Dict:
+    """Worker entrypoint for parallel self-play."""
+    model_path = worker_args["model_path"]
+    device = worker_args["device"]
+
+    if model_path and os.path.exists(model_path):
+        model = create_model({"device": device})
+        model.load(model_path)
+    else:
+        model = create_model({"device": device})
+
+    model.set_training(False)
+
+    sp = SelfPlay(
+        model=model,
+        num_simulations=worker_args["num_simulations"],
+        temperature=worker_args["temperature"],
+        max_moves=worker_args["max_moves"],
+        repetition_draw_count=worker_args["repetition_draw_count"],
+        resign_threshold=worker_args["resign_threshold"],
+        min_resign_moves=worker_args["min_resign_moves"],
+        speed_bonus_max=worker_args["speed_bonus_max"],
+        draw_penalty=worker_args["draw_penalty"],
+        batch_size=worker_args["batch_size"],
+        device=device,
+    )
+
+    worker_id = worker_args["worker_id"]
+    num_games = worker_args["num_games"]
+    all_data = []
+    results = {"red": 0, "black": 0, "draw": 0}
+
+    for game_idx in range(num_games):
+        print(f"\n[Worker {worker_id}] === 第 {game_idx + 1}/{num_games} 局 ===")
+        result, move_data = sp.play_game(temperature=worker_args["temperature"])
+        if result == 1:
+            results["red"] += 1
+        elif result == -1:
+            results["black"] += 1
+        else:
+            results["draw"] += 1
+        all_data.extend(move_data)
+
+    return {"results": results, "data": all_data}
+
+
+def _run_selfplay_workers(num_workers: int, worker_args: List[Dict]) -> List[Dict]:
+    """Execute self-play workers in parallel."""
+    if num_workers <= 1:
+        return [_run_selfplay_worker(args) for args in worker_args]
+
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=num_workers) as pool:
+        return pool.map(_run_selfplay_worker, worker_args)
 
 
 class SelfPlay:
@@ -41,6 +151,7 @@ class SelfPlay:
         min_resign_moves: int = 30,
         speed_bonus_max: float = 0.3,
         draw_penalty: float = 0.1,
+        batch_size: int = 16,
         dirichlet_alpha: float = 0.03,
         epsilon: float = 0.25,
         device: str = "cpu",
@@ -54,6 +165,7 @@ class SelfPlay:
         self.min_resign_moves = max(0, min_resign_moves)
         self.speed_bonus_max = speed_bonus_max
         self.draw_penalty = draw_penalty
+        self.batch_size = batch_size
         self.dirichlet_alpha = dirichlet_alpha
         self.epsilon = epsilon
         self.device = device
@@ -113,6 +225,7 @@ class SelfPlay:
                 dirichlet_alpha=self.dirichlet_alpha,
                 epsilon=self.epsilon,
                 device=self.device,
+                batch_size=self.batch_size,
             ),
             -1: MCTSPlayer(  # Black player
                 model=self.model,
@@ -121,6 +234,7 @@ class SelfPlay:
                 dirichlet_alpha=self.dirichlet_alpha,
                 epsilon=self.epsilon,
                 device=self.device,
+                batch_size=self.batch_size,
             ),
         }
 
@@ -157,8 +271,16 @@ class SelfPlay:
             # Get current player
             mcts_player = players[current_player]
 
-            # Get move from MCTS
-            move = mcts_player.get_move(game_state, temperature=temperature)
+            # Prefer a single-search API when available to avoid doubling MCTS work.
+            if hasattr(mcts_player, "get_move_and_policy"):
+                move, policy = mcts_player.get_move_and_policy(
+                    game_state,
+                    temperature=temperature,
+                    policy_temperature=temperature,
+                )
+            else:
+                move = mcts_player.get_move(game_state, temperature=temperature)
+                policy = mcts_player.get_policy(game_state, temperature=temperature)
 
             if move is None:
                 # No valid moves
@@ -167,10 +289,13 @@ class SelfPlay:
 
             print(f"选择落子: ({move[0]},{move[1]}) -> ({move[2]},{move[3]})")
 
-            # Get policy before move
-            policy = mcts_player.get_policy(game_state, temperature=0.0)
-
             board = game_state.to_numpy()
+            captured_piece = _get_piece_at_destination(game_state, move)
+            step_capture_reward = compute_step_capture_reward(captured_piece)
+            step_reward_by_player = compute_signed_step_reward_by_player(
+                captured_piece,
+                current_player,
+            )
 
             # Execute move
             if not game_state.do_move(move):
@@ -185,6 +310,8 @@ class SelfPlay:
                     "move": move,
                     "player": current_player,
                     "move_idx": move_count,
+                    "step_capture_reward": step_capture_reward,
+                    "step_reward_by_player": step_reward_by_player,
                 }
                 move_data.append(move_entry)
 
@@ -242,7 +369,10 @@ class SelfPlay:
 
         # Add result to all move data (from winner's perspective)
         if result is not None:
-            for entry in move_data:
+            cumulative_step_rewards = accumulate_step_reward_events(
+                [entry.get("step_reward_by_player", {1: 0.0, -1: 0.0}) for entry in move_data]
+            )
+            for event_index, entry in enumerate(move_data):
                 # 游戏结果奖励 (主要)
                 result_reward = result * entry["player"]
 
@@ -260,6 +390,7 @@ class SelfPlay:
                 else:
                     entry["value"] = capture_reward * 0.5  # 和棋时吃子奖励权重降低
 
+                entry["value"] += cumulative_step_rewards[event_index].get(entry["player"], 0.0)
                 entry["value"] += speed_bonuses.get(entry["player"], 0.0)
                 entry["value"] -= draw_penalties.get(entry["player"], 0.0)
                 entry["value"] -= repeat_penalties.get(entry["player"], 0.0)
@@ -348,27 +479,7 @@ class SelfPlay:
 
     def _save_data(self, data: List[Dict], save_dir: str, suffix: str):
         """Save data to file"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(save_dir, f"selfplay_{suffix}_{timestamp}.pt")
-
-        # Convert to tensors for efficient storage
-        boards = []
-        policies = []
-        values = []
-
-        for entry in data:
-            boards.append(torch.from_numpy(entry["board"]))
-            policies.append(torch.from_numpy(entry["policy"]))
-            values.append(torch.tensor(entry.get("value", 0), dtype=torch.float32))
-
-        if boards:
-            dataset = {
-                "boards": torch.stack(boards),
-                "policies": torch.stack(policies),
-                "values": torch.stack(values),
-            }
-            torch.save(dataset, filename)
-            print(f"已保存 {len(data)} 个局面到 {filename}")
+        save_dataset(data, save_dir, suffix)
 
 
 def run_selfplay(
@@ -382,6 +493,8 @@ def run_selfplay(
     min_resign_moves: int = 30,
     speed_bonus_max: float = 0.3,
     draw_penalty: float = 0.1,
+    batch_size: int = 16,
+    num_workers: int = 1,
     device: str = "cpu",
 ):
     """Run self-play to generate training data"""
@@ -389,40 +502,78 @@ def run_selfplay(
     print("自我对弈数据生成")
     print("=" * 50)
 
-    # Load model
-    if model_path and os.path.exists(model_path):
-        print(f"[模型] 从 {model_path} 加载模型")
-        model = create_model({"device": device})
-        model.load(model_path)
-        print(f"[模型] 加载成功，设备: {device}")
-    else:
-        if model_path:
-            print(f"[模型] 路径 {model_path} 不存在，创建新模型")
+    if num_workers <= 1 or num_games <= 1:
+        # Load model
+        if model_path and os.path.exists(model_path):
+            print(f"[模型] 从 {model_path} 加载模型")
+            model = create_model({"device": device})
+            model.load(model_path)
+            print(f"[模型] 加载成功，设备: {device}")
         else:
-            print("[模型] 未指定模型路径，创建新模型")
-        model = create_model({"device": device})
-        print(f"[模型] 新模型创建成功，设备: {device}")
+            if model_path:
+                print(f"[模型] 路径 {model_path} 不存在，创建新模型")
+            else:
+                print("[模型] 未指定模型路径，创建新模型")
+            model = create_model({"device": device})
+            print(f"[模型] 新模型创建成功，设备: {device}")
 
-    model.set_training(False)
+        model.set_training(False)
 
-    # Create self-play
-    sp = SelfPlay(
-        model=model,
-        num_simulations=num_simulations,
-        temperature=temperature,
-        max_moves=max_moves,
-        repetition_draw_count=repetition_draw_count,
-        resign_threshold=resign_threshold,
-        min_resign_moves=min_resign_moves,
-        speed_bonus_max=speed_bonus_max,
-        draw_penalty=draw_penalty,
-        device=device,
-    )
+        sp = SelfPlay(
+            model=model,
+            num_simulations=num_simulations,
+            temperature=temperature,
+            max_moves=max_moves,
+            repetition_draw_count=repetition_draw_count,
+            resign_threshold=resign_threshold,
+            min_resign_moves=min_resign_moves,
+            speed_bonus_max=speed_bonus_max,
+            draw_penalty=draw_penalty,
+            batch_size=batch_size,
+            device=device,
+        )
+        return sp.generate_dataset(num_games=num_games, temperature=temperature)
 
-    # Generate data
-    data = sp.generate_dataset(num_games=num_games, temperature=temperature)
+    print(f"[并行] 启动 {num_workers} 个 worker")
+    chunks = split_games_across_workers(num_games, num_workers)
+    worker_args = []
+    for worker_id, chunk_games in enumerate(chunks, start=1):
+        worker_args.append(
+            {
+                "worker_id": worker_id,
+                "model_path": model_path,
+                "num_games": chunk_games,
+                "num_simulations": num_simulations,
+                "temperature": temperature,
+                "max_moves": max_moves,
+                "repetition_draw_count": repetition_draw_count,
+                "resign_threshold": resign_threshold,
+                "min_resign_moves": min_resign_moves,
+                "speed_bonus_max": speed_bonus_max,
+                "draw_penalty": draw_penalty,
+                "batch_size": batch_size,
+                "device": device,
+            }
+        )
 
-    return data
+    worker_results = _run_selfplay_workers(len(worker_args), worker_args)
+    results = {"red": 0, "black": 0, "draw": 0}
+    all_data: List[Dict] = []
+
+    for item in worker_results:
+        worker_stats = item.get("results", {})
+        results["red"] += worker_stats.get("red", 0)
+        results["black"] += worker_stats.get("black", 0)
+        results["draw"] += worker_stats.get("draw", 0)
+        all_data.extend(item.get("data", []))
+
+    print("\n=== 最终结果 ===")
+    print(f"红方胜: {results['red']}")
+    print(f"黑方胜: {results['black']}")
+    print(f"和棋: {results['draw']}")
+    print(f"总局面数: {len(all_data)}")
+    save_dataset(all_data, "data", "final")
+    return all_data
 
 
 if __name__ == "__main__":
@@ -464,6 +615,18 @@ if __name__ == "__main__":
         default=0.1,
         help="Symmetric penalty applied to both sides on draws",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Batch size for MCTS neural network inference",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel self-play workers",
+    )
     parser.add_argument("--device", type=str, default="cpu", help="Device")
 
     args = parser.parse_args()
@@ -479,5 +642,7 @@ if __name__ == "__main__":
         min_resign_moves=args.min_resign_moves,
         speed_bonus_max=args.speed_bonus_max,
         draw_penalty=args.draw_penalty,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         device=args.device,
     )

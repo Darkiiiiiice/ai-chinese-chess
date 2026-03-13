@@ -1,6 +1,8 @@
 """Reward-related helpers."""
 
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
+
+from game.pieces import get_piece_value
 
 
 Move = Tuple[int, int, int, int]
@@ -83,3 +85,43 @@ def compute_draw_penalty_by_player(
     if result != 0 or penalty <= 0:
         return {1: 0.0, -1: 0.0}
     return {1: penalty, -1: penalty}
+
+
+def compute_step_capture_reward(captured_piece: str) -> float:
+    """Reward an immediate capture using normalized piece value."""
+    if not captured_piece:
+        return 0.0
+    return get_piece_value(captured_piece) / 9.0
+
+
+def compute_signed_step_reward_by_player(
+    captured_piece: str,
+    mover: int,
+) -> Dict[int, float]:
+    """Return a zero-sum immediate reward keyed by player."""
+    reward = compute_step_capture_reward(captured_piece)
+    if mover not in (1, -1) or reward == 0.0:
+        return {1: 0.0, -1: 0.0}
+    return {
+        mover: reward,
+        -mover: -reward,
+    }
+
+
+def accumulate_step_reward_events(
+    step_reward_events: Iterable[Dict[int, float]],
+) -> List[Dict[int, float]]:
+    """Build suffix sums of signed step rewards for each player."""
+    events = list(step_reward_events)
+    cumulative: List[Dict[int, float]] = [{1: 0.0, -1: 0.0} for _ in events]
+    running = {1: 0.0, -1: 0.0}
+
+    for idx in range(len(events) - 1, -1, -1):
+        event = events[idx] or {}
+        running = {
+            1: running[1] + float(event.get(1, 0.0)),
+            -1: running[-1] + float(event.get(-1, 0.0)),
+        }
+        cumulative[idx] = dict(running)
+
+    return cumulative

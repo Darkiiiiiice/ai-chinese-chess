@@ -358,6 +358,8 @@ def test_execute_move_failure_does_not_wait_opponent(monkeypatch):
     )
 
     assert fake_browser.wait_calls == 0
+    assert result["result"] == -1
+    assert result["my_outcome"] == "loss"
     assert result["samples"] == 0
 
 
@@ -423,3 +425,37 @@ def test_retry_prefers_different_source_piece_after_failure(monkeypatch):
     assert len(fake_browser.executed_moves) >= 2
     assert fake_browser.executed_moves[0][:2] == primary_move[:2]
     assert fake_browser.executed_moves[1][:2] != primary_move[:2]
+
+
+def test_get_ai_move_with_policy_records_soft_policy_from_mcts(monkeypatch):
+    captured = {}
+
+    class _FakeMCTSPlayer:
+        def __init__(self, **kwargs):
+            return None
+
+        def get_move_and_policy(self, state, temperature=None, policy_temperature=0.0):
+            captured["temperature"] = temperature
+            captured["policy_temperature"] = policy_temperature
+            policy = np.zeros(8010, dtype=np.float32)
+            policy[0] = 0.7
+            policy[1] = 0.3
+            return (0, 0, 0, 1), policy
+
+    monkeypatch.setattr("ai.mcts.MCTSPlayer", _FakeMCTSPlayer)
+
+    move, policy = asyncio.run(
+        play_script._get_ai_move_with_policy(
+            game_state=GameState(),
+            model=object(),
+            num_simulations=1,
+            device="cpu",
+            batch_size=1,
+        )
+    )
+
+    assert move == (0, 0, 0, 1)
+    assert captured["temperature"] == 1.0
+    assert captured["policy_temperature"] == 1.0
+    assert policy[0] == 0.7
+    assert policy[1] == 0.3

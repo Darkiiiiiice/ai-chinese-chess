@@ -302,6 +302,72 @@ def test_run_selfplay_forwards_draw_penalty(monkeypatch):
     assert captured["init"]["draw_penalty"] == 0.25
 
 
+def test_run_selfplay_forwards_batch_size(monkeypatch):
+    captured = {}
+
+    class _FakeSelfPlay:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def generate_dataset(self, num_games=100, temperature=1.0, save_dir="data"):
+            return []
+
+    monkeypatch.setattr(self_play_script, "SelfPlay", _FakeSelfPlay)
+    monkeypatch.setattr(self_play_script, "create_model", lambda cfg: _FakeModel())
+
+    self_play_script.run_selfplay(
+        model_path=None,
+        num_games=2,
+        num_simulations=3,
+        temperature=0.5,
+        batch_size=64,
+        device="cpu",
+    )
+
+    assert captured["init"]["batch_size"] == 64
+
+
+def test_split_games_across_workers_balances_chunks():
+    assert self_play_script.split_games_across_workers(10, 3) == [4, 3, 3]
+    assert self_play_script.split_games_across_workers(2, 4) == [1, 1]
+    assert self_play_script.split_games_across_workers(0, 4) == []
+
+
+def test_run_selfplay_parallel_aggregates_worker_results(monkeypatch):
+    captured = {}
+
+    def _fake_parallel(num_workers, worker_args):
+        captured["num_workers"] = num_workers
+        captured["worker_args"] = worker_args
+        return [
+            {
+                "results": {"red": 1, "black": 0, "draw": 0},
+                "data": [{"move_idx": 0}],
+            },
+            {
+                "results": {"red": 0, "black": 1, "draw": 0},
+                "data": [{"move_idx": 1}, {"move_idx": 2}],
+            },
+        ]
+
+    monkeypatch.setattr(self_play_script, "_run_selfplay_workers", _fake_parallel)
+    monkeypatch.setattr(self_play_script, "create_model", lambda cfg: _FakeModel())
+    monkeypatch.setattr(self_play_script, "save_dataset", lambda data, save_dir, suffix: None)
+
+    data = self_play_script.run_selfplay(
+        model_path=None,
+        num_games=3,
+        num_simulations=5,
+        temperature=0.5,
+        num_workers=2,
+        device="cpu",
+    )
+
+    assert captured["num_workers"] == 2
+    assert [args["num_games"] for args in captured["worker_args"]] == [2, 1]
+    assert len(data) == 3
+
+
 def test_play_game_applies_speed_bonus_to_quick_winner(monkeypatch):
     class _OneMoveWinGameState:
         def __init__(self, **kwargs):
@@ -486,3 +552,208 @@ def test_play_game_stops_when_mcts_returns_illegal_move(monkeypatch, capsys):
     assert len(move_data) == 0
     assert "非法落子" in out
     assert out.count("当前玩家: 红方") == 1
+
+
+def test_play_game_only_runs_single_mcts_search_per_step(monkeypatch):
+    calls = {"searches": 0}
+
+    class _OneMoveWinGameState:
+        def __init__(self, **kwargs):
+            self.current_player = 1
+            self.board = [["" for _ in range(9)] for _ in range(10)]
+            self.move_history = []
+            self.captured_by = {1: {}, -1: {}}
+            self._game_over = False
+            self._result = None
+
+        def is_game_over(self):
+            return self._game_over
+
+        def get_game_result(self):
+            return self._result
+
+        def to_numpy(self):
+            return np.zeros((15, 10, 9), dtype=np.float32)
+
+        def do_move(self, move):
+            self._game_over = True
+            self._result = 1
+            self.current_player = -1
+            self.move_history.append(move)
+            return True
+
+        def get_capture_reward(self, player):
+            return 0.0
+
+    class _CountingMCTSPlayer:
+        def __init__(self, **kwargs):
+            return None
+
+        def get_move(self, state, temperature=None):
+            calls["searches"] += 1
+            return (0, 0, 0, 1)
+
+        def get_policy(self, state, temperature=None):
+            raise AssertionError("self-play should not trigger a second MCTS search for policy")
+
+        def get_move_and_policy(self, state, temperature=None, policy_temperature=0.0):
+            calls["searches"] += 1
+            policy = np.zeros(8010, dtype=np.float32)
+            policy[0] = 1.0
+            return (0, 0, 0, 1), policy
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(self_play_script, "GameState", _OneMoveWinGameState)
+    monkeypatch.setattr(self_play_script, "MCTSPlayer", _CountingMCTSPlayer)
+
+    sp = self_play_script.SelfPlay(
+        model=_FakeModel(),
+        num_simulations=1,
+        temperature=1.0,
+        max_moves=100,
+        resign_threshold=None,
+        device="cpu",
+    )
+
+    result, move_data = sp.play_game(temperature=1.0, record_moves=True)
+
+    assert result == 1
+    assert len(move_data) == 1
+    assert calls["searches"] == 1
+
+
+def test_play_game_records_soft_policy_from_mcts(monkeypatch):
+    captured = {}
+
+    class _OneMoveWinGameState:
+        def __init__(self, **kwargs):
+            self.current_player = 1
+            self.board = [["" for _ in range(9)] for _ in range(10)]
+            self.move_history = []
+            self.captured_by = {1: {}, -1: {}}
+            self._game_over = False
+            self._result = None
+
+        def is_game_over(self):
+            return self._game_over
+
+        def get_game_result(self):
+            return self._result
+
+        def to_numpy(self):
+            return np.zeros((15, 10, 9), dtype=np.float32)
+
+        def do_move(self, move):
+            self._game_over = True
+            self._result = 1
+            self.current_player = -1
+            self.move_history.append(move)
+            return True
+
+        def get_capture_reward(self, player):
+            return 0.0
+
+        def get_piece(self, x, y):
+            return ""
+
+    class _SoftPolicyMCTSPlayer:
+        def __init__(self, **kwargs):
+            return None
+
+        def get_move_and_policy(self, state, temperature=None, policy_temperature=0.0):
+            captured["policy_temperature"] = policy_temperature
+            policy = np.zeros(8010, dtype=np.float32)
+            policy[0] = 0.6
+            policy[1] = 0.4
+            return (0, 0, 0, 1), policy
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(self_play_script, "GameState", _OneMoveWinGameState)
+    monkeypatch.setattr(self_play_script, "MCTSPlayer", _SoftPolicyMCTSPlayer)
+
+    sp = self_play_script.SelfPlay(
+        model=_FakeModel(),
+        num_simulations=1,
+        temperature=1.0,
+        max_moves=100,
+        resign_threshold=None,
+        device="cpu",
+    )
+
+    result, move_data = sp.play_game(temperature=1.0, record_moves=True)
+
+    assert result == 1
+    assert captured["policy_temperature"] == 1.0
+    assert move_data[0]["policy"][0] == 0.6
+    assert move_data[0]["policy"][1] == 0.4
+
+
+def test_play_game_applies_step_capture_reward_on_draw(monkeypatch):
+    class _OneMoveDrawCaptureGameState:
+        def __init__(self, **kwargs):
+            self.current_player = 1
+            self.board = [["" for _ in range(9)] for _ in range(10)]
+            self.board[1][0] = "P"
+            self.move_history = []
+            self.captured_by = {1: {}, -1: {}}
+            self._game_over = False
+            self._result = None
+
+        def is_game_over(self):
+            return self._game_over
+
+        def get_game_result(self):
+            return self._result
+
+        def to_numpy(self):
+            return np.zeros((15, 10, 9), dtype=np.float32)
+
+        def do_move(self, move):
+            self.board[1][0] = ""
+            self._game_over = True
+            self._result = 0
+            self.current_player = -1
+            self.move_history.append(move)
+            return True
+
+        def get_capture_reward(self, player):
+            return 0.0
+
+        def get_piece(self, x, y):
+            return self.board[y][x]
+
+    class _CaptureMoveMCTSPlayer:
+        def __init__(self, **kwargs):
+            return None
+
+        def get_move_and_policy(self, state, temperature=None, policy_temperature=0.0):
+            policy = np.zeros(8010, dtype=np.float32)
+            policy[0] = 1.0
+            return (0, 0, 0, 1), policy
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(self_play_script, "GameState", _OneMoveDrawCaptureGameState)
+    monkeypatch.setattr(self_play_script, "MCTSPlayer", _CaptureMoveMCTSPlayer)
+
+    sp = self_play_script.SelfPlay(
+        model=_FakeModel(),
+        num_simulations=1,
+        temperature=1.0,
+        max_moves=100,
+        resign_threshold=None,
+        speed_bonus_max=0.0,
+        draw_penalty=0.0,
+        device="cpu",
+    )
+
+    result, move_data = sp.play_game(temperature=1.0, record_moves=True)
+
+    assert result == 0
+    assert len(move_data) == 1
+    assert move_data[0]["value"] > 0.0

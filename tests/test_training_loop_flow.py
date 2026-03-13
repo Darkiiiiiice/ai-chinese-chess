@@ -47,6 +47,31 @@ def test_training_loop_selfplay_forwards_reward_tuning(monkeypatch, tmp_path):
     assert captured["init"]["draw_penalty"] == 0.22
 
 
+def test_training_loop_selfplay_forwards_batch_size(monkeypatch, tmp_path):
+    captured = {}
+
+    class _FakeSelfPlay:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def generate_dataset(self, num_games=100, temperature=1.0, save_dir="data"):
+            return []
+
+    monkeypatch.setattr(training_loop_script, "SelfPlay", _FakeSelfPlay)
+
+    loop = training_loop_script.TrainingLoop(
+        data_dir=str(tmp_path / "data"),
+        model_dir=str(tmp_path / "models"),
+        log_dir=str(tmp_path / "logs"),
+        sp_batch_size=64,
+    )
+    loop.model = object()
+
+    loop.selfplay()
+
+    assert captured["init"]["batch_size"] == 64
+
+
 def test_training_loop_online_play_forwards_reward_tuning(monkeypatch, tmp_path):
     captured = {}
 

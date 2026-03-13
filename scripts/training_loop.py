@@ -35,6 +35,7 @@ class TrainingLoop:
         sp_games: int = 100,
         sp_simulations: int = 400,
         sp_temperature: float = 1.0,
+        sp_batch_size: int = 16,
         speed_bonus_max: float = 0.3,
         draw_penalty: float = 0.1,
         # Training config
@@ -63,6 +64,7 @@ class TrainingLoop:
         self.sp_games = sp_games
         self.sp_simulations = sp_simulations
         self.sp_temperature = sp_temperature
+        self.sp_batch_size = sp_batch_size
         self.speed_bonus_max = speed_bonus_max
         self.draw_penalty = draw_penalty
 
@@ -126,6 +128,7 @@ class TrainingLoop:
             model=self.model,
             num_simulations=self.sp_simulations,
             temperature=self.sp_temperature,
+            batch_size=self.sp_batch_size,
             speed_bonus_max=self.speed_bonus_max,
             draw_penalty=self.draw_penalty,
             device=self.device,
@@ -474,6 +477,7 @@ if __name__ == "__main__":
     parser.add_argument("--sp-games", type=int, default=100)
     parser.add_argument("--sp-simulations", type=int, default=400)
     parser.add_argument("--sp-temperature", type=float, default=1.0)
+    parser.add_argument("--sp-batch-size", type=int, default=16)
     parser.add_argument("--speed-bonus-max", type=float, default=0.3)
     parser.add_argument("--draw-penalty", type=float, default=0.1)
 
@@ -506,6 +510,7 @@ if __name__ == "__main__":
         sp_games=args.sp_games,
         sp_simulations=args.sp_simulations,
         sp_temperature=args.sp_temperature,
+        sp_batch_size=args.sp_batch_size,
         speed_bonus_max=args.speed_bonus_max,
         draw_penalty=args.draw_penalty,
         train_epochs=args.epochs,
