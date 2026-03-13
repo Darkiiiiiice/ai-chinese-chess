@@ -1,0 +1,9 @@
+.claude
+.venv
+data/
+models/**
+logs
+.playwright-mcp
+.pytest_cache
+.ruff_cache
+*/__pycache__
