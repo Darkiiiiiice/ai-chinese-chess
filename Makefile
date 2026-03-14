@@ -1,6 +1,7 @@
 .PHONY: install setup play train selfplay evaluate clean help \
         play-visible play-headless train-fast selfplay-fast cycle \
-        online-cycle mixed-cycle parity-check
+        online-cycle mixed-cycle parity-check \
+        data-merge data-list data-clean
 
 # ============================================================
 # 默认值
@@ -36,6 +37,11 @@ SELFPLAY_WORKERS ?= 1
 
 # 评估参数
 EVAL_GAMES ?= 100
+
+# 数据管理参数
+DATA_DIR ?= data
+KEEP_FILES ?= 3
+DATA_PATTERNS ?= selfplay_*.pt online_*.pt
 
 # ============================================================
 # 安装命令
@@ -215,6 +221,36 @@ mixed-cycle:
 		--device $(DEVICE)
 
 # ============================================================
+# 数据管理命令
+# ============================================================
+
+data-list:
+	uv run python scripts/merge_data.py list --data $(DATA_DIR)
+
+data-merge:
+	uv run python scripts/merge_data.py merge \
+		--data $(DATA_DIR) \
+		--patterns $(DATA_PATTERNS)
+
+data-merge-dedup:
+	uv run python scripts/merge_data.py merge \
+		--data $(DATA_DIR) \
+		--patterns $(DATA_PATTERNS) \
+		--dedup
+
+data-clean:
+	uv run python scripts/merge_data.py clean \
+		--data $(DATA_DIR) \
+		--keep $(KEEP_FILES) \
+		--type selfplay
+
+data-clean-all:
+	uv run python scripts/merge_data.py clean \
+		--data $(DATA_DIR) \
+		--keep $(KEEP_FILES) \
+		--type all
+
+# ============================================================
 # 其他命令
 # ============================================================
 
@@ -258,6 +294,13 @@ help:
 	@echo "  make cycle          自我对弈 + 训练"
 	@echo "  make online-cycle   在线对弈 + 训练"
 	@echo "  make mixed-cycle    在线 + 自我对弈 + 训练"
+	@echo ""
+	@echo "【数据管理】"
+	@echo "  make data-list      列出所有数据文件"
+	@echo "  make data-merge     合并所有数据文件"
+	@echo "  make data-merge-dedup 合并并去重"
+	@echo "  make data-clean     清理旧 selfplay 文件"
+	@echo "  make data-clean-all 清理所有类型旧文件"
 	@echo ""
 	@echo "【其他】"
 	@echo "  make clean          清理生成的文件"
@@ -372,6 +415,19 @@ help:
 	@echo "                      默认: 100"
 	@echo "                      范围: 10-1000"
 	@echo "                      作用: 评估模型时的对局数量"
+	@echo ""
+	@echo "【数据管理参数】"
+	@echo "  DATA_DIR=path       数据目录"
+	@echo "                      默认: data"
+	@echo "                      作用: 指定数据文件存储目录"
+	@echo ""
+	@echo "  KEEP_FILES=N        保留文件数"
+	@echo "                      默认: 3"
+	@echo "                      作用: data-clean 时保留的最新文件数"
+	@echo ""
+	@echo "  DATA_PATTERNS=...   文件匹配模式"
+	@echo "                      默认: 'selfplay_*.pt online_*.pt'"
+	@echo "                      作用: data-merge 时匹配的文件模式"
 	@echo ""
 	@echo "============================================================"
 	@echo "                      使用示例"

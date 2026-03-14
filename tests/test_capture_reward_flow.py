@@ -51,10 +51,10 @@ def test_online_game_data_set_values_uses_player_specific_capture_reward():
         capture_rewards_by_player={-1: 1.0, 1: -1.0},
     )
 
-    # Winner gets positive capture bonus.
-    assert data.samples[0]["value"] > 1.0
-    # Loser gets additional penalty.
-    assert data.samples[1]["value"] < -1.0
+    # Winner gets positive capture bonus, clamped to max 1.0
+    assert data.samples[0]["value"] == 1.0
+    # Loser gets additional penalty, clamped to min -1.0
+    assert data.samples[1]["value"] == -1.0
 
 
 def test_online_game_data_set_values_applies_repeat_penalty():
@@ -106,7 +106,8 @@ def test_online_game_data_set_values_applies_speed_bonus_for_winner():
         speed_bonus_by_player={1: 0.25, -1: 0.0},
     )
 
-    assert data.samples[0]["value"] == 1.25
+    # Value is clamped to [-1, 1] range to match tanh output
+    assert data.samples[0]["value"] == 1.0  # Would be 1.25, but clamped
     assert data.samples[1]["value"] == -1.0
 
 

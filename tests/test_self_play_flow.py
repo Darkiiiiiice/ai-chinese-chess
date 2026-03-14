@@ -428,7 +428,8 @@ def test_play_game_applies_speed_bonus_to_quick_winner(monkeypatch):
 
     assert result == 1
     assert len(move_data) == 1
-    assert move_data[0]["value"] > 1.0
+    # Value is clamped to [-1, 1] to match tanh output
+    assert move_data[0]["value"] == 1.0
 
 
 def test_play_game_logs_each_step(monkeypatch, capsys):

@@ -64,6 +64,7 @@ class OnlineGameData:
         policy: np.ndarray,
         move: tuple,
         player: int,
+        game_id: str | None = None,
         step_capture_reward: float = 0.0,
         event_index: int | None = None,
     ):
@@ -73,6 +74,7 @@ class OnlineGameData:
             'policy': policy,
             'move': move,
             'player': player,
+            'game_id': game_id,
             'step_capture_reward': step_capture_reward,
             'event_index': event_index,
         })
@@ -140,6 +142,9 @@ class OnlineGameData:
             entry['value'] -= draw_penalties.get(player, 0.0)
             entry['value'] -= penalties.get(player, 0.0)
 
+            # 归一化到 [-1, 1] 范围，匹配 tanh 输出
+            entry['value'] = max(-1.0, min(1.0, entry['value']))
+
     def save(self, filepath: str):
         """Save data to PyTorch format (compatible with train.py)"""
         if not self.samples:
@@ -148,16 +153,20 @@ class OnlineGameData:
         boards = []
         policies = []
         values = []
+        game_ids = []
 
+        fallback_game_id = Path(filepath).stem
         for entry in self.samples:
             boards.append(torch.from_numpy(entry['board']))
             policies.append(torch.from_numpy(entry['policy']))
             values.append(torch.tensor(entry.get('value', 0), dtype=torch.float32))
+            game_ids.append(entry.get('game_id') or fallback_game_id)
 
         dataset = {
             'boards': torch.stack(boards),
             'policies': torch.stack(policies),
             'values': torch.stack(values),
+            'game_ids': game_ids,
         }
 
         torch.save(dataset, filepath)
@@ -236,6 +245,7 @@ async def play_game_with_data(
     # Initialize game state with empty board
     game_state = GameState([["" for _ in range(9)] for _ in range(10)])
     my_color = browser.player_color
+    game_id = f"online_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
     # Read initial board from browser
     board_state = await browser.read_board()
@@ -337,6 +347,7 @@ async def play_game_with_data(
                     policy=policy,
                     move=executed_move,
                     player=current_player,
+                    game_id=game_id,
                     step_capture_reward=step_capture_reward,
                     event_index=event_index,
                 )
@@ -545,6 +556,7 @@ async def play_game_with_data(
                 "result": result,
                 "num_moves": move_count,
                 "player_color": browser.player_color,
+                "game_id": game_id,
                 "timestamp": timestamp,
             }, f, indent=2)
 

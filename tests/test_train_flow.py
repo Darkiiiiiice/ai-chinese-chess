@@ -39,3 +39,36 @@ def test_dataset_loads_online_and_selfplay_files(tmp_path):
     dataset = train_script.AlphaZeroDataset(str(tmp_path))
 
     assert len(dataset) == 2
+
+
+def test_split_indices_by_source_keeps_sources_disjoint():
+    samples = [
+        {"source_id": "a"},
+        {"source_id": "a"},
+        {"source_id": "b"},
+        {"source_id": "b"},
+        {"source_id": "c"},
+    ]
+
+    train_indices, val_indices, grouped = train_script.split_indices_by_source(
+        samples,
+        val_split=0.3,
+        seed=42,
+    )
+
+    train_sources = {samples[i]["source_id"] for i in train_indices}
+    val_sources = {samples[i]["source_id"] for i in val_indices}
+
+    assert grouped is True
+    assert train_indices
+    assert val_indices
+    assert train_sources.isdisjoint(val_sources)
+
+
+def test_early_stopper_triggers_after_patience_without_improvement():
+    stopper = train_script.EarlyStopper(patience=2, min_delta=0.01)
+
+    assert stopper.step(1.0) is False
+    assert stopper.step(0.95) is False
+    assert stopper.step(0.949) is False
+    assert stopper.step(0.948) is True

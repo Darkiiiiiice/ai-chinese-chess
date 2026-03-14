@@ -23,6 +23,22 @@ from game.reward import (
     compute_step_capture_reward,
     compute_speed_bonus_by_player,
 )
+from utils.log import wprint
+
+
+# Worker ID for logging (set by each worker process)
+_worker_id = None
+
+
+def set_worker_id(worker_id: int):
+    """Set the worker ID for the current process"""
+    global _worker_id
+    _worker_id = f"Worker-{worker_id}"
+
+
+def log(message: str):
+    """Log with worker prefix"""
+    wprint(message, _worker_id)
 
 
 def build_repetition_key(board: List[List[str]], current_player: int) -> str:
@@ -65,32 +81,46 @@ def save_dataset(data: List[Dict], save_dir: str, suffix: str):
     boards = []
     policies = []
     values = []
+    game_ids = []
 
     for entry in data:
         boards.append(torch.from_numpy(entry["board"]))
         policies.append(torch.from_numpy(entry["policy"]))
         values.append(torch.tensor(entry.get("value", 0), dtype=torch.float32))
+        game_ids.append(entry.get("game_id"))
 
     if boards:
         dataset = {
             "boards": torch.stack(boards),
             "policies": torch.stack(policies),
             "values": torch.stack(values),
+            "game_ids": game_ids,
         }
         torch.save(dataset, filename)
-        print(f"已保存 {len(data)} 个局面到 {filename}")
+        log(f"已保存 {len(data)} 个局面到 {filename}")
 
 
 def _run_selfplay_worker(worker_args: Dict) -> Dict:
     """Worker entrypoint for parallel self-play."""
+    # Set worker ID for logging
+    worker_id = worker_args["worker_id"]
+    set_worker_id(worker_id)
+
     model_path = worker_args["model_path"]
     device = worker_args["device"]
 
     if model_path and os.path.exists(model_path):
         model = create_model({"device": device})
+        log(f"[模型] 从 {model_path} 加载模型")
         model.load(model_path)
+        log(f"[模型] 加载成功，设备: {device}")
     else:
+        if model_path:
+            log(f"[模型] 路径 {model_path} 不存在，创建新模型")
+        else:
+            log("[模型] 未指定模型路径，创建新模型")
         model = create_model({"device": device})
+        log(f"[模型] 新模型创建成功，设备: {device}")
 
     model.set_training(False)
 
@@ -108,14 +138,17 @@ def _run_selfplay_worker(worker_args: Dict) -> Dict:
         device=device,
     )
 
-    worker_id = worker_args["worker_id"]
     num_games = worker_args["num_games"]
     all_data = []
     results = {"red": 0, "black": 0, "draw": 0}
 
     for game_idx in range(num_games):
-        print(f"\n[Worker {worker_id}] === 第 {game_idx + 1}/{num_games} 局 ===")
-        result, move_data = sp.play_game(temperature=worker_args["temperature"])
+        log(f"\n=== 第 {game_idx + 1}/{num_games} 局 ===")
+        game_id = f"selfplay_worker{worker_id}_game{game_idx}"
+        result, move_data = sp.play_game(
+            temperature=worker_args["temperature"],
+            game_id=game_id,
+        )
         if result == 1:
             results["red"] += 1
         elif result == -1:
@@ -198,7 +231,10 @@ class SelfPlay:
         return self.idx_to_move.get(idx, (0, 0, 0, 0))
 
     def play_game(
-        self, temperature: float = None, record_moves: bool = True
+        self,
+        temperature: float = None,
+        record_moves: bool = True,
+        game_id: str | None = None,
     ) -> Tuple[int, List[Dict]]:
         """
         Play one self-play game
@@ -250,8 +286,8 @@ class SelfPlay:
             current_player = game_state.current_player
             step_no = move_count + 1
 
-            print(f"\n--- 第 {step_no} 步 ---")
-            print(f"当前玩家: {'红方' if current_player == 1 else '黑方'}")
+            log(f"\n--- 第 {step_no} 步 ---")
+            log(f"当前玩家: {'红方' if current_player == 1 else '黑方'}")
 
             # Optional resignation based on value head confidence.
             if (
@@ -262,7 +298,7 @@ class SelfPlay:
                 if predicted_value <= self.resign_threshold:
                     resigned_player = current_player
                     resigned_text = "红方" if current_player == 1 else "黑方"
-                    print(
+                    log(
                         f"  {resigned_text}认输: 价值 {predicted_value:.3f} "
                         f"<= 阈值 {self.resign_threshold:.3f}"
                     )
@@ -284,10 +320,10 @@ class SelfPlay:
 
             if move is None:
                 # No valid moves
-                print("未找到有效落子，结束本局")
+                log("未找到有效落子，结束本局")
                 break
 
-            print(f"选择落子: ({move[0]},{move[1]}) -> ({move[2]},{move[3]})")
+            log(f"选择落子: ({move[0]},{move[1]}) -> ({move[2]},{move[3]})")
 
             board = game_state.to_numpy()
             captured_piece = _get_piece_at_destination(game_state, move)
@@ -299,7 +335,7 @@ class SelfPlay:
 
             # Execute move
             if not game_state.do_move(move):
-                print(f"非法落子: ({move[0]},{move[1]}) -> ({move[2]},{move[3]})，结束本局")
+                log(f"非法落子: ({move[0]},{move[1]}) -> ({move[2]},{move[3]})，结束本局")
                 break
 
             # Record data (from perspective of current player)
@@ -309,6 +345,7 @@ class SelfPlay:
                     "policy": policy,
                     "move": move,
                     "player": current_player,
+                    "game_id": game_id,
                     "move_idx": move_count,
                     "step_capture_reward": step_capture_reward,
                     "step_reward_by_player": step_reward_by_player,
@@ -326,10 +363,10 @@ class SelfPlay:
                 repeat_count = position_history[position_key]
                 if repeat_count >= self.repetition_draw_count:
                     # Draw by repetition
-                    print(f"  [重复检测] 局面第 {repeat_count} 次重复，判定和棋")
+                    log(f"  [重复检测] 局面第 {repeat_count} 次重复，判定和棋")
                     break
                 elif repeat_count >= 3:
-                    print(f"  [重复检测] 局面第 {repeat_count} 次出现 (阈值: {self.repetition_draw_count})")
+                    log(f"  [重复检测] 局面第 {repeat_count} 次出现 (阈值: {self.repetition_draw_count})")
             else:
                 position_history[position_key] = 1
 
@@ -365,7 +402,7 @@ class SelfPlay:
 
         # Print game result
         result_text = "红方胜" if result == 1 else ("黑方胜" if result == -1 else "和棋")
-        print(f"\n[游戏结束] 结果: {result_text}")
+        log(f"\n[游戏结束] 结果: {result_text}")
 
         # Add result to all move data (from winner's perspective)
         if result is not None:
@@ -395,26 +432,29 @@ class SelfPlay:
                 entry["value"] -= draw_penalties.get(entry["player"], 0.0)
                 entry["value"] -= repeat_penalties.get(entry["player"], 0.0)
 
+                # 归一化到 [-1, 1] 范围，匹配 tanh 输出
+                entry["value"] = max(-1.0, min(1.0, entry["value"]))
+
             # Print reward summary
-            print("[奖励统计]")
-            print(f"  红方吃子: {game_state.captured_by.get(1, {})}")
-            print(f"  黑方吃子: {game_state.captured_by.get(-1, {})}")
+            log("[奖励统计]")
+            log(f"  红方吃子: {game_state.captured_by.get(1, {})}")
+            log(f"  黑方吃子: {game_state.captured_by.get(-1, {})}")
             red_samples = [e for e in move_data if e["player"] == 1]
             black_samples = [e for e in move_data if e["player"] == -1]
             if red_samples:
                 avg_red = sum(e["value"] for e in red_samples) / len(red_samples)
-                print(f"  红方样本平均奖励: {avg_red:.3f} ({len(red_samples)}个样本)")
+                log(f"  红方样本平均奖励: {avg_red:.3f} ({len(red_samples)}个样本)")
                 for i, s in enumerate(red_samples[:5]):  # 只打印前5个
-                    print(f"    [{i+1}] 回合{s['move_idx']:3d} | 落子{s['move']} | 奖励:{s['value']:+.3f}")
+                    log(f"    [{i+1}] 回合{s['move_idx']:3d} | 落子{s['move']} | 奖励:{s['value']:+.3f}")
                 if len(red_samples) > 5:
-                    print(f"    ... 还有 {len(red_samples)-5} 个样本")
+                    log(f"    ... 还有 {len(red_samples)-5} 个样本")
             if black_samples:
                 avg_black = sum(e["value"] for e in black_samples) / len(black_samples)
-                print(f"  黑方样本平均奖励: {avg_black:.3f} ({len(black_samples)}个样本)")
+                log(f"  黑方样本平均奖励: {avg_black:.3f} ({len(black_samples)}个样本)")
                 for i, s in enumerate(black_samples[:5]):  # 只打印前5个
-                    print(f"    [{i+1}] 回合{s['move_idx']:3d} | 落子{s['move']} | 奖励:{s['value']:+.3f}")
+                    log(f"    [{i+1}] 回合{s['move_idx']:3d} | 落子{s['move']} | 奖励:{s['value']:+.3f}")
                 if len(black_samples) > 5:
-                    print(f"    ... 还有 {len(black_samples)-5} 个样本")
+                    log(f"    ... 还有 {len(black_samples)-5} 个样本")
 
         return result, move_data
 
@@ -442,10 +482,14 @@ class SelfPlay:
         results = {"red": 0, "black": 0, "draw": 0}
 
         for game_idx in range(num_games):
-            print(f"\n=== 第 {game_idx + 1}/{num_games} 局 ===")
+            log(f"\n=== 第 {game_idx + 1}/{num_games} 局 ===")
 
             # Play game
-            result, move_data = self.play_game(temperature=temperature)
+            game_id = f"selfplay_game_{game_idx}"
+            result, move_data = self.play_game(
+                temperature=temperature,
+                game_id=game_id,
+            )
 
             # Record result
             if result == 1:
@@ -455,12 +499,12 @@ class SelfPlay:
             else:
                 results["draw"] += 1
 
-            print(f"对局结果: {result} ({results})")
+            log(f"对局结果: {result} ({results})")
 
             # Add to dataset
             all_data.extend(move_data)
 
-            print(f"总局面数: {len(all_data)}")
+            log(f"总局面数: {len(all_data)}")
 
             # Save periodically
             if (game_idx + 1) % 10 == 0:
@@ -469,11 +513,11 @@ class SelfPlay:
         # Final save
         self._save_data(all_data, save_dir, "final")
 
-        print("\n=== 最终结果 ===")
-        print(f"红方胜: {results['red']}")
-        print(f"黑方胜: {results['black']}")
-        print(f"和棋: {results['draw']}")
-        print(f"总局面数: {len(all_data)}")
+        log("\n=== 最终结果 ===")
+        log(f"红方胜: {results['red']}")
+        log(f"黑方胜: {results['black']}")
+        log(f"和棋: {results['draw']}")
+        log(f"总局面数: {len(all_data)}")
 
         return all_data
 
@@ -498,24 +542,24 @@ def run_selfplay(
     device: str = "cpu",
 ):
     """Run self-play to generate training data"""
-    print("=" * 50)
-    print("自我对弈数据生成")
-    print("=" * 50)
+    log("=" * 50)
+    log("自我对弈数据生成")
+    log("=" * 50)
 
     if num_workers <= 1 or num_games <= 1:
         # Load model
         if model_path and os.path.exists(model_path):
-            print(f"[模型] 从 {model_path} 加载模型")
+            log(f"[模型] 从 {model_path} 加载模型")
             model = create_model({"device": device})
             model.load(model_path)
-            print(f"[模型] 加载成功，设备: {device}")
+            log(f"[模型] 加载成功，设备: {device}")
         else:
             if model_path:
-                print(f"[模型] 路径 {model_path} 不存在，创建新模型")
+                log(f"[模型] 路径 {model_path} 不存在，创建新模型")
             else:
-                print("[模型] 未指定模型路径，创建新模型")
+                log("[模型] 未指定模型路径，创建新模型")
             model = create_model({"device": device})
-            print(f"[模型] 新模型创建成功，设备: {device}")
+            log(f"[模型] 新模型创建成功，设备: {device}")
 
         model.set_training(False)
 
@@ -534,7 +578,7 @@ def run_selfplay(
         )
         return sp.generate_dataset(num_games=num_games, temperature=temperature)
 
-    print(f"[并行] 启动 {num_workers} 个 worker")
+    log(f"[并行] 启动 {num_workers} 个 worker")
     chunks = split_games_across_workers(num_games, num_workers)
     worker_args = []
     for worker_id, chunk_games in enumerate(chunks, start=1):
@@ -567,11 +611,11 @@ def run_selfplay(
         results["draw"] += worker_stats.get("draw", 0)
         all_data.extend(item.get("data", []))
 
-    print("\n=== 最终结果 ===")
-    print(f"红方胜: {results['red']}")
-    print(f"黑方胜: {results['black']}")
-    print(f"和棋: {results['draw']}")
-    print(f"总局面数: {len(all_data)}")
+    log("\n=== 最终结果 ===")
+    log(f"红方胜: {results['red']}")
+    log(f"黑方胜: {results['black']}")
+    log(f"和棋: {results['draw']}")
+    log(f"总局面数: {len(all_data)}")
     save_dataset(all_data, "data", "final")
     return all_data
 
